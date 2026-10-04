@@ -30,6 +30,25 @@ fingerprints enrolled asks for a touch first.
 
 The tool refuses a release older than the device's firmware unless given `--allow-downgrade`.
 
+## Smart card (pcscd)
+
+The PC talks to the device's PIV smart card through `pcscd` and the `ccid` driver (packages
+`ccid opensc pcsc-tools python-pyscard`). The stock driver does not list the tinyTouch's USB ID,
+so `pcsc/make-driver-bundle.py` writes a driver directory with it added, and a `pcscd` drop-in
+points there; nothing under `/usr` is changed.
+
+    sudo systemctl enable --now pcscd.socket
+    sudo python3 linux/pcsc/make-driver-bundle.py /etc/tinytouch/pcsc-drivers
+    sudo install -D -m 0644 linux/pcsc/pcscd-tinytouch.conf /etc/systemd/system/pcscd.service.d/tinytouch.conf
+    sudo systemctl daemon-reload
+
+Re-run the first `python3` line after a `ccid` upgrade. `pcsc_scan -r` then lists the reader and
+`pkcs15-tool --list-certificates` shows the two certificates. To undo: remove the drop-in and
+`/etc/tinytouch/pcsc-drivers`, run `daemon-reload`, and `disable --now pcscd.socket`.
+
+The firmware reconnects over USB whenever the device wakes from USB suspend, which drops the
+smart card and the serial port for about a second. The udev rule keeps the device awake.
+
 ## Setting up the device
 
 `tinytouch.py` sets up and inspects the tinyTouch over its serial port. Each command opens the
