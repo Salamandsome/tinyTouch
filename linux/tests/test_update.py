@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import io
 import json
 import os
 import struct
@@ -10,14 +11,19 @@ import tempfile
 import threading
 import unittest
 import zlib
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa, utils
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import fake_device  # noqa: E402
 import tinytouch_serial as ts  # noqa: E402
 import tinytouch_update as tu  # noqa: E402
+from test_serial import ModemLines  # noqa: E402
 
 
 class FakeDevice(threading.Thread):
@@ -213,6 +219,106 @@ class StageTest(unittest.TestCase):
         self.assertIsNone(device.token)
         self.assertFalse(any(isinstance(c, str) and c.startswith("OTA COMMIT")
                              for c in device.commands))
+
+
+class MainTest(unittest.TestCase):
+    """tinytouch_update.main end to end: a fake download, the fake 0.1.34 console."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+        cls.image = signed_image(cls.key)
+
+    def run_main(self, *argv, state=None, pinned=None):
+        """Run main(argv) with the release served locally and `pinned` (default: the test key)
+        as the release key; the device is a fake on a pseudo-terminal."""
+        state = state or fake_device.new_state()
+        if not state.paths:
+            fake_device.FakeDevice(state)
+        manifest = {"version": argv[0], "ota": {
+            "file": "tiny_touch_unified.bin", "size": len(self.image),
+            "sha256": hashlib.sha256(self.image).hexdigest()}}
+        files = {"release-manifest.json": json.dumps(manifest).encode(),
+                 "tiny_touch_unified.bin": self.image}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(tu.urllib.request, "urlopen",
+                               lambda url, timeout: io.BytesIO(files[url.rsplit("/", 1)[1]])), \
+                mock.patch.object(tu.check_image, "__defaults__",
+                                  (pinned or key_sha256(self.key),)), \
+                mock.patch.object(tu, "find_ports", lambda: list(state.paths)), \
+                mock.patch.object(ts.fcntl, "ioctl", ModemLines()), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = tu.main(list(argv))
+        self.state, self.out, self.err = state, out.getvalue(), err.getvalue()
+        return code
+
+    def test_stages_the_image(self):
+        self.assertEqual(self.run_main("0.1.35"), 0)
+        self.assertEqual(bytes(self.state.uploaded), self.image)
+        self.assertEqual(self.state.commands[:3], ["STATUS", "OTA ABORT", "AUTH"])
+        self.assertIn("Staged", self.out)
+
+    def test_other_key_is_refused_before_the_device(self):
+        self.assertEqual(self.run_main("0.1.35", pinned=tu.UPSTREAM_KEY_SHA256), 1)
+        self.assertIn("not with upstream", self.err)
+        self.assertEqual(self.state.commands, [])
+
+    def test_busy_ota_is_refused(self):
+        self.assertEqual(self.run_main("0.1.35", state=fake_device.new_state(ota="staged")), 1)
+        self.assertIn("ota=idle", self.err)
+        self.assertEqual(self.state.commands, ["STATUS"])
+
+    def test_other_protocol_is_refused(self):
+        self.assertEqual(self.run_main("0.1.35", state=fake_device.new_state(protocol="5")), 1)
+        self.assertIn("protocol=6", self.err)
+        self.assertEqual(self.state.commands, ["STATUS"])
+
+    def test_same_version_writes_nothing(self):
+        self.assertEqual(self.run_main("0.1.34"), 0)
+        self.assertIn("Already on this version", self.out)
+        self.assertEqual(self.state.commands, ["STATUS"])
+
+    def test_check_writes_nothing(self):
+        self.assertEqual(self.run_main("0.1.35", "--check"), 0)
+        self.assertIn("nothing written", self.out)
+        self.assertEqual(self.state.commands, ["STATUS"])
+
+    def test_unconfirmed_staging_is_an_error(self):
+        for reply in ("OK OTA STAGED", "OK OTA COMMIT"):
+            state = fake_device.new_state(staged_reply=reply)
+            self.assertEqual(self.run_main("0.1.35", state=state), 1)
+            self.assertIn("did not confirm", self.err)
+            self.assertNotIn("Staged.", self.out)
+
+    def test_downgrade_is_refused(self):
+        for argv in (("0.1.33",), ("0.1.33", "--check")):
+            self.assertEqual(self.run_main(*argv), 1)
+            self.assertIn("older than the device's firmware 0.1.34", self.err)
+            self.assertEqual(self.state.commands, ["STATUS"])
+
+    def test_downgrade_with_permission(self):
+        self.assertEqual(self.run_main("0.1.33", "--allow-downgrade"), 0)
+        self.assertEqual(bytes(self.state.uploaded), self.image)
+
+    def test_versions_compare_as_numbers(self):
+        self.assertEqual(self.run_main("0.1.9", state=fake_device.new_state(firmware="0.1.10")), 1)
+        self.assertIn("older", self.err)
+        state = fake_device.new_state(firmware="0.1.9")
+        self.assertEqual(self.run_main("0.1.10", "--check", state=state), 0)
+
+    def test_development_build_needs_permission(self):
+        state = fake_device.new_state(firmware="development")
+        self.assertEqual(self.run_main("0.1.35", "--check", state=state), 1)
+        self.assertIn("--allow-downgrade", self.err)
+
+    def test_port_must_be_a_tinytouch(self):
+        state = fake_device.new_state()
+        device = fake_device.FakeDevice(state)
+        other = fake_device.FakeDevice(fake_device.new_state())  # not listed by find_ports
+        self.assertEqual(self.run_main("0.1.35", "--port", other.path, state=state), 1)
+        self.assertIn("not an attached tinyTouch", self.err)
+        self.assertEqual(other.state.commands, [])
+        self.assertEqual(self.run_main("0.1.35", "--check", "--port", device.path, state=state), 0)
 
 
 if __name__ == "__main__":

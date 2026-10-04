@@ -2,7 +2,7 @@
 """Update a tinyTouch to a stock upstream release through the device's own serial OTA.
 
 The device writes the image to its spare app slot, checks the SHA-256 and upstream's RSA signature
-at commit, and boots the new image on the next power cycle, falling back if it fails to start.
+at commit, and boots the new image on the next power cycle, falling back only if it fails before finishing startup.
 Before anything reaches the device this tool checks the image against the release manifest and
 verifies its signature block against upstream's pinned release key.
 """
@@ -13,6 +13,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import re
 import secrets
 import struct
@@ -136,19 +137,35 @@ def stage(port: Port, image: bytes, say=print) -> None:
         raise UpdateError(f"the device did not confirm the staged image: {line}")
 
 
+def is_downgrade(device: str | None, version: str) -> bool:
+    """Whether `version` is older than the device's firmware. A device version that is not
+    X.Y.Z (a development build) counts as newer, so replacing it needs the user's say-so."""
+    match = re.match(r"([0-9]+)\.([0-9]+)\.([0-9]+)", device or "")
+    if not match:
+        return True
+    return tuple(map(int, match.groups())) > tuple(map(int, version.split(".")))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("version", help="stock upstream release to install, e.g. 0.1.34")
     parser.add_argument("--port", help="serial node (default: the one attached tinyTouch)")
     parser.add_argument("--check", action="store_true",
                         help="download and verify, read the device's status, write nothing")
+    parser.add_argument("--allow-downgrade", action="store_true",
+                        help="install a release older than the device's firmware")
     args = parser.parse_args(argv)
     try:
         image, _ = fetch_release(args.version)
         check_image(image)
         print(f"Image v{args.version}: {len(image)} bytes, sha256 "
               f"{hashlib.sha256(image).hexdigest()}, signed with upstream's release key.")
-        ports = [args.port] if args.port else find_ports()
+        ports = find_ports()
+        if args.port:
+            # The upload must not go to some other serial device.
+            if os.path.realpath(args.port) not in ports:
+                raise UpdateError(f"{args.port} is not an attached tinyTouch")
+            ports = [os.path.realpath(args.port)]
         if len(ports) != 1:
             raise UpdateError(f"expected one tinyTouch, found {len(ports)}")
         with Port(ports[0]) as port:
@@ -160,6 +177,9 @@ def main(argv: list[str] | None = None) -> int:
             if status.get("firmware") == args.version:
                 print("Already on this version.")
                 return 0
+            if is_downgrade(status.get("firmware"), args.version) and not args.allow_downgrade:
+                raise UpdateError(f"v{args.version} is older than the device's firmware "
+                                  f"{status.get('firmware')}; use --allow-downgrade to install it")
             if args.check:
                 print("Check passed; nothing written.")
                 return 0
