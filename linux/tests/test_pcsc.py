@@ -68,6 +68,7 @@ class BundleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             system = fake_system_bundle(Path(tmp) / "sys")
             with unittest.mock.patch.object(mdb, "SYSTEM_BUNDLE", system), \
+                    unittest.mock.patch("sys.stdout", new=io.StringIO()), \
                     unittest.mock.patch("sys.stderr", new=io.StringIO()) as err:
                 self.assertEqual(mdb.main(["/proc/nonexistent/out"]), 1)
                 self.assertIn("error:", err.getvalue())
