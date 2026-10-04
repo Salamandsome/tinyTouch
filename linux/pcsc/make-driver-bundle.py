@@ -10,6 +10,7 @@ tinyTouch added, and links the driver binary rather than copying it. Re-run afte
 from __future__ import annotations
 
 import argparse
+import os
 import plistlib
 import sys
 from pathlib import Path
@@ -22,7 +23,7 @@ def add_tinytouch(plist: dict) -> dict:
     """The driver's Info.plist with the tinyTouch in its three parallel reader lists."""
     lists = plist["ifdVendorID"], plist["ifdProductID"], plist["ifdFriendlyName"]
     if len({len(entries) for entries in lists}) != 1:
-        # pcscd treats unequal lengths as fatal and loads no driver at all.
+        # pcscd exits at startup on unequal lengths, so no reader would work at all.
         raise ValueError("the driver's reader lists have different lengths")
     ids = list(zip(*lists))
     if (VENDOR, PRODUCT, NAME) not in ids:
@@ -55,6 +56,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("target", type=Path,
                         help="driver directory to write, e.g. /etc/tinytouch/pcsc-drivers")
     args = parser.parse_args(argv)
+    # pcscd runs as its own user; sudo keeps the caller's umask, which may be 077.
+    os.umask(0o022)
     try:
         bundle = make_bundle(args.target)
     except (OSError, KeyError, ValueError, plistlib.InvalidFileException) as exc:

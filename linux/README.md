@@ -46,9 +46,12 @@ points there; nothing under `/usr` is changed.
     sudo systemctl daemon-reload
     sudo systemctl restart pcscd.service
 
-Re-run the `python3` line after a `ccid` upgrade, then restart `pcscd.service` again. `pcsc_scan -r` then lists the reader and
-`pkcs15-tool --list-certificates` shows the two certificates. To undo: remove the drop-in and
-`/etc/tinytouch/pcsc-drivers`, run `daemon-reload`, and `disable --now pcscd.socket`.
+Re-run the `python3` line after a `ccid` upgrade, then restart `pcscd.service` again.
+`pcsc_scan -r` then lists the reader and `pkcs15-tool --list-certificates` shows the two
+certificates. While the drop-in is in place `pcscd` reads drivers only from that directory, so
+a reader whose driver is another package would stop working; none is handled yet. To undo:
+remove the drop-in and `/etc/tinytouch/pcsc-drivers`, run `daemon-reload` and restart
+`pcscd.service`; disable `pcscd.socket` only if it was enabled for this.
 
 ## Setting up the device
 
