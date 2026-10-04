@@ -10,11 +10,11 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import os
 import sys
 import time
 
 import tinytouch_serial as ts
-import tinytouch_update
 from tinytouch_serial import (DeviceError, DeviceGone, DeviceRefused, DeviceTimeout, Port,
                               find_ports)
 
@@ -95,7 +95,12 @@ def confirm(word: str) -> None:
 
 
 def open_port(args: argparse.Namespace) -> Port:
-    nodes = [args.port] if args.port else find_ports()
+    nodes = find_ports()
+    if args.port:
+        # Commands written to some other serial device could do anything to it.
+        if os.path.realpath(args.port) not in nodes:
+            raise CliError(f"{args.port} is not an attached tinyTouch")
+        nodes = [os.path.realpath(args.port)]
     if not nodes:
         raise CliError("no tinyTouch found (plugged in, udev rule installed?)")
     if len(nodes) > 1:
@@ -138,6 +143,12 @@ def fits(finger: int, capacity: int) -> bool:
     slots = [0 if s == TEMPLATE_LIMIT else s
              for s in range((finger - 1) * VIEWS + 1, finger * VIEWS + 1)]
     return capacity >= TEMPLATE_LIMIT or max(slots) < capacity
+
+
+def complete_others(groups: dict[int, int], pending: int, finger: int) -> list[int]:
+    """Fingers other than `finger` that can still authorise: a partial or pending one may be
+    rolled back by the next enroll or delete."""
+    return [n for n, views in groups.items() if n not in (finger, pending) and views == VIEWS]
 
 
 def authorize(port: Port, purpose: str) -> str:
@@ -220,7 +231,7 @@ def cmd_enroll(args: argparse.Namespace) -> int:
     """Upstream enroll_finger, with guards for the last finger."""
     with open_port(args) as port:
         device_status(port, sensor=True)
-        groups, capacity, _ = finger_inventory(port)
+        groups, capacity, pending = finger_inventory(port)
         finger = args.finger or next(
             (n for n in range(1, FINGERS + 1) if n not in groups and fits(n, capacity)), 0)
         if not finger:
@@ -228,7 +239,7 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         if not fits(finger, capacity):
             raise CliError(f"this sensor has no room for finger {finger}")
         replace = finger in groups
-        others = [n for n, views in groups.items() if n != finger and views]
+        others = complete_others(groups, pending, finger)
         if replace and not args.replace:
             raise CliError(f"finger {finger} is already enrolled; use --replace to enroll it again")
         if replace:
@@ -265,10 +276,10 @@ def cmd_delete(args: argparse.Namespace) -> int:
     finger = args.finger
     with open_port(args) as port:
         device_status(port)
-        groups, _, _ = finger_inventory(port)
+        groups, _, pending = finger_inventory(port)
         if finger not in groups:
             raise CliError(f"finger {finger} is not enrolled")
-        last = not [n for n, views in groups.items() if n != finger and views]
+        last = not complete_others(groups, pending, finger)
         if last and not args.force:
             raise CliError(f"finger {finger} is the last enrolled finger; with none, the device "
                            "grants AUTH without a touch. Use --force to delete it anyway")
@@ -402,7 +413,9 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_update(args: argparse.Namespace) -> int:
+    import tinytouch_update  # needs python-cryptography, which no other command does
     return tinytouch_update.main([args.version] + (["--check"] if args.check else [])
+                                 + (["--allow-downgrade"] if args.allow_downgrade else [])
                                  + (["--port", args.port] if args.port else []))
 
 
@@ -443,6 +456,8 @@ def parser() -> argparse.ArgumentParser:
     sub = add("update", cmd_update, "update the firmware to a stock upstream release")
     sub.add_argument("version", help="release, e.g. 0.1.34")
     sub.add_argument("--check", action="store_true", help="verify only; write nothing")
+    sub.add_argument("--allow-downgrade", action="store_true",
+                     help="install a release older than the device's firmware")
     return top
 
 

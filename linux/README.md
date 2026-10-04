@@ -1,6 +1,8 @@
 # tinyTouch on Linux
 
-Host support for Linux, in progress. Needs Python 3 and `python-cryptography`.
+An unofficial Linux port, maintained in a fork; upstream tinyTouch does not support it. Host
+support is in progress. Needs Python 3.9 or newer; `tinytouch_update.py` (and `tinytouch.py
+update`) also needs `python-cryptography`.
 
 ## Device access
 
@@ -10,7 +12,9 @@ off it and the device out of USB autosuspend:
     sudo install -m 0644 linux/udev/70-tinytouch.rules /etc/udev/rules.d/
     sudo udevadm control --reload
 
-then replug the tinyTouch.
+then replug the tinyTouch. To remove the rule:
+
+    sudo rm /etc/udev/rules.d/70-tinytouch.rules && sudo udevadm control --reload
 
 ## Updating the firmware
 
@@ -19,9 +23,12 @@ then replug the tinyTouch.
 
 The tool downloads the stock release, checks it against the release manifest and checks its
 signature against upstream's release key before sending anything. The device writes the image to
-its spare slot, checks the hash and signature again, and switches only when both pass. If the new
-firmware fails to start, the device falls back to the old one. Settings, fingerprints and keys are
-kept. A unit with fingerprints enrolled asks for a touch first.
+its spare slot, checks the hash and signature again, and switches only when both pass. The device
+goes back to the old firmware only if the new image fails before it finishes starting; firmware
+that starts but then misbehaves stays. Settings, fingerprints and keys are kept. A unit with
+fingerprints enrolled asks for a touch first.
+
+The tool refuses a release older than the device's firmware unless given `--allow-downgrade`.
 
 ## Setting up the device
 
@@ -38,8 +45,14 @@ port, does its job and closes it; close any other program using the port first.
     python3 linux/tinytouch.py logs              # recent device log
     python3 linux/tinytouch.py update 0.1.34     # same as tinytouch_update.py
 
-`--port /dev/ttyACMn` picks the device when several are attached. Commands that change
-something ask for a touch on the sensor first.
+`--port /dev/ttyACMn` picks the device when several are attached; the tools refuse a node that is
+not an attached tinyTouch. Commands that change something ask for a touch on the sensor first.
+
+After any command that asked for a touch, the device stays authorised for about two minutes.
+During that time any program running as you can change the device without a touch.
+
+`piv_touch` and the device mode cannot be set with this tool; both are already right on a stock
+unit (`status --check` shows them).
 
 Recommended order on a new device:
 
@@ -61,4 +74,6 @@ What cannot be undone:
 An enrollment that is interrupted (Ctrl-C, timeout, unplug) is rolled back by the device; the
 other fingers are not changed.
 
-Run the tests with `python3 -m unittest discover -s linux/tests`.
+The tests are run by hand, from the repository root:
+
+    python3 -m unittest discover -s linux/tests

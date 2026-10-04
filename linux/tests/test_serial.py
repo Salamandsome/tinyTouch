@@ -20,9 +20,11 @@ class ModemLines:
 
     def __init__(self):
         self.calls = []
+        self.requests = []  # every ioctl, as (fd, request)
         self.real = fcntl.ioctl
 
     def __call__(self, fd, request, *args):
+        self.requests.append((fd, request))
         if request in (termios.TIOCMBIS, termios.TIOCMBIC):
             self.calls.append((request, int.from_bytes(args[0], sys.byteorder)))
             raise OSError(25, "Inappropriate ioctl for device")
@@ -111,6 +113,38 @@ class ReturnTest(unittest.TestCase):
         with self.assertRaisesRegex(ts.DeviceGone, "did not come back"):
             ts.wait_for_return(port, 0.5, find=lambda: [])
         self.assertLess(time.monotonic() - started, 3)
+
+    def test_two_devices_are_never_opened(self):
+        # Which one is ours is unknowable, so neither gets the next command.
+        device = FakeDevice()
+        port = ts.Port(device.path)
+        device.vanish()
+        others = [FakeDevice(), FakeDevice()]
+        with mock.patch.object(ts, "Port", wraps=ts.Port) as opened, \
+                self.assertRaisesRegex(ts.DeviceGone, "did not come back"):
+            ts.wait_for_return(port, 0.5, find=lambda: [d.path for d in others])
+        self.assertEqual(opened.call_count, 0)
+        self.assertEqual([d.state.commands for d in others], [[], []])
+
+
+class ExclusiveTest(unittest.TestCase):
+    def test_open_is_exclusive(self):
+        # TIOCEXCL keeps a second program (another tool, ModemManager) off the session.
+        device = FakeDevice()
+        modem = ModemLines()
+        with mock.patch.object(ts.fcntl, "ioctl", modem):
+            ts.Port(device.path).close()
+        self.assertIn(termios.TIOCEXCL, [request for _, request in modem.requests])
+
+
+class StatusTimeoutTest(unittest.TestCase):
+    def test_status_outlasts_the_sensor_retries(self):
+        # fingerprint.c fingerprint_count retries with recovery for up to ~14 s.
+        device = FakeDevice()
+        with ts.Port(device.path) as port, \
+                mock.patch.object(port, "command", wraps=port.command) as command:
+            port.status()
+        self.assertGreaterEqual(command.call_args.args[1], 15)
 
 
 class DtrTest(unittest.TestCase):

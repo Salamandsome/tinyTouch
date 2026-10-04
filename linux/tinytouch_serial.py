@@ -187,7 +187,9 @@ class Port:
             raise DeviceRefused(lines[-1])
         return lines
 
-    def status(self, timeout: float = 4.0) -> dict[str, str]:
+    # STATUS counts the templates (fingerprint.c fingerprint_count), which with a failing sensor
+    # retries with recovery for ~14 s; waiting longer lets it report sensor=offline, not time out.
+    def status(self, timeout: float = 20.0) -> dict[str, str]:
         line = self.command("STATUS", timeout)[-1]
         if not line.startswith("OK STATUS "):
             raise DeviceError(f"unexpected STATUS reply: {line}")

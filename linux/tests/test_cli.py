@@ -1,5 +1,6 @@
 """The tinytouch command line against a fake firmware 0.1.34 console on a pseudo-terminal."""
 
+import importlib
 import io
 import json
 import sys
@@ -58,6 +59,36 @@ class ParserTest(CliTest):
         self.assertIn("no tinyTouch", self.err)
         self.assertNotIn("Traceback", self.err)
 
+    def test_port_must_be_a_tinytouch(self):
+        state = new_state()
+        device = FakeDevice(state)
+        other = FakeDevice(new_state())  # a serial device find_ports does not list
+        self.assertEqual(self.run_cli("--port", other.path, "status", state=state,
+                                      device=False), 1)
+        self.assertIn("not an attached tinyTouch", self.err)
+        self.assertEqual(other.state.commands, [])
+        self.assertEqual(self.run_cli("--port", device.path, "status", state=state,
+                                      device=False), 0)
+        self.assertEqual(state.commands, ["STATUS"])
+
+    def test_other_protocol_is_refused(self):
+        self.assertEqual(self.run_cli("fingers", state=new_state(protocol="5")), 1)
+        self.assertIn("protocol 6", self.err)
+        self.assertEqual(self.state.commands, ["STATUS"])
+
+    def test_status_works_without_cryptography(self):
+        # Only update needs python-cryptography; make it unimportable and load tinytouch afresh.
+        state = new_state()
+        hidden = {name: None for name in sys.modules if name.split(".")[0] == "cryptography"}
+        with mock.patch.dict(sys.modules, {**hidden, "cryptography": None}):
+            for name in ("tinytouch", "tinytouch_update"):
+                sys.modules.pop(name, None)
+            fresh = importlib.import_module("tinytouch")
+            with mock.patch.object(tt, "main", fresh.main), \
+                    mock.patch.object(fresh, "find_ports", lambda: list(state.paths)):
+                self.assertEqual(self.run_cli("status", state=state), 0)
+        self.assertIn("0.1.34", self.out)
+
 
 class StatusTest(CliTest):
     def test_human(self):
@@ -98,6 +129,18 @@ class ReadTest(CliTest):
         self.assertEqual(self.run_cli("fingers"), 0)
         self.assertIn("No fingers enrolled", self.out)
 
+    def test_small_sensor_offers_only_fitting_fingers(self):
+        # Capacity 20 holds templates 1-19, so fingers 1-4 (finger_profiles_block_fits).
+        self.assertEqual(self.run_cli("fingers", state=new_state(capacity=20)), 0)
+        self.assertIn("Free: 1, 2, 3, 4\n", self.out)
+
+    def test_fits(self):
+        self.assertTrue(tt.fits(4, 20))
+        self.assertFalse(tt.fits(5, 20))
+        self.assertTrue(tt.fits(10, 40))  # its last view is template 0
+        self.assertFalse(tt.fits(10, 39))
+        self.assertFalse(tt.fits(1, 0))
+
 
 class EnrollTest(CliTest):
     def test_first_free_finger_with_prompts(self):
@@ -107,6 +150,34 @@ class EnrollTest(CliTest):
         for text in ("Touch the sensor with an enrolled finger", "View 4 of 4", "Lift",
                      "again", "Finger 2 is enrolled"):
             self.assertIn(text, self.out)
+
+    def test_sensor_not_ready_is_refused(self):
+        self.assertEqual(self.run_cli("enroll", state=new_state(sensor="offline")), 1)
+        self.assertIn("sensor is unavailable", self.err)
+        self.assertEqual(self.sent("AUTH"), [])
+
+    def test_finger_without_room_is_refused(self):
+        state = new_state(capacity=20)
+        self.assertEqual(self.run_cli("enroll", "--finger", "5", state=state), 1)
+        self.assertIn("no room for finger 5", self.err)
+        self.assertEqual(self.sent("AUTH"), [])
+        state = new_state(capacity=20, fingers={n: 4 for n in range(1, 5)})
+        self.assertEqual(self.run_cli("enroll", state=state), 1)
+        self.assertIn("no free finger slot", self.err)
+        self.assertEqual(self.sent("AUTH"), [])
+
+    def test_incomplete_result_is_an_error(self):
+        state = new_state(fingers=dict(ONE), enroll_views=3)
+        self.assertEqual(self.run_cli("enroll", state=state), 1)
+        self.assertIn("does not report all 4 views", self.err)
+        self.assertNotIn("is enrolled", self.out)
+
+    def test_partial_or_pending_other_finger_does_not_count(self):
+        for state in (new_state(fingers={1: 4, 2: 3}), new_state(fingers=dict(TWO), pending=2)):
+            self.assertEqual(self.run_cli("enroll", "--finger", "1", "--replace", state=state,
+                                          answers=["replace"]), 1)
+            self.assertIn("only enrolled finger", self.err)
+            self.assertEqual(self.sent("AUTH"), [])
 
     def test_zero_fingers_says_auth_is_free(self):
         self.assertEqual(self.run_cli("enroll"), 0)
@@ -186,6 +257,18 @@ class DeleteTest(CliTest):
         self.assertEqual(self.state.fingers, {})
         self.assertIn("without a touch", self.out)
 
+    def test_partial_or_pending_other_finger_does_not_count(self):
+        for state in (new_state(fingers={1: 4, 2: 3}), new_state(fingers=dict(TWO), pending=2)):
+            self.assertEqual(self.run_cli("delete", "1", state=state, answers=["delete"]), 1)
+            self.assertIn("last enrolled finger", self.err)
+            self.assertEqual(self.sent("AUTH"), [])
+
+    def test_finger_still_listed_is_an_error(self):
+        state = new_state(fingers=dict(TWO), delete_ignored=True)
+        self.assertEqual(self.run_cli("delete", "2", state=state, answers=["delete"]), 1)
+        self.assertIn("still listed", self.err)
+        self.assertNotIn("was deleted", self.out)
+
     def test_unknown_finger(self):
         self.assertEqual(self.run_cli("delete", "5", state=new_state(fingers=dict(ONE))), 1)
         self.assertEqual(self.sent("AUTH"), [])
@@ -201,6 +284,20 @@ class PivCreateTest(CliTest):
         self.assertEqual(self.run_cli("piv-create", state=new_state(fingers={1: 3}),
                                       answers=["create"]), 1)
         self.assertEqual(self.sent("AUTH"), [])
+
+    def test_sensor_not_ready_is_refused(self):
+        state = new_state(fingers=dict(ONE), sensor="offline")
+        self.assertEqual(self.run_cli("piv-create", state=state, answers=["create"]), 1)
+        self.assertIn("sensor is unavailable", self.err)
+        self.assertEqual(self.sent("AUTH"), [])
+
+    def test_auth_without_touch_aborts(self):
+        # The inventory showed a finger, yet AUTH reports none: never make keys then.
+        state = new_state(fingers=dict(ONE), auth_reply="OK AUTH first_setup=1")
+        self.assertEqual(self.run_cli("piv-create", state=state, answers=["create"]), 1)
+        self.assertIn("no enrolled finger after all", self.err)
+        self.assertEqual(self.sent("PIV"), [])
+        self.assertEqual(self.state.piv, "unconfigured")
 
     def test_refuses_existing_keys(self):
         state = new_state(fingers=dict(ONE), piv="ready")
@@ -270,6 +367,11 @@ class ConfigTest(CliTest):
         self.assertIn("100", self.err)
         self.assertEqual(self.sent("SET"), [])
 
+    def test_read_back_mismatch_is_an_error(self):
+        state = new_state(set_ignored=True)
+        self.assertEqual(self.run_cli("config", "led-idle-color", "purple", state=state), 1)
+        self.assertIn("reports led_idle_color=blue after the change", self.err)
+
     def test_mode_is_not_a_setting(self):
         self.assertEqual(self.run_cli("config", "mode", "hid"), 1)
         self.assertEqual(self.sent("SET"), [])
@@ -277,9 +379,13 @@ class ConfigTest(CliTest):
 
 class UpdateTest(CliTest):
     def test_delegates(self):
-        with mock.patch.object(tt.tinytouch_update, "main", return_value=0) as update:
+        import tinytouch_update
+        with mock.patch.object(tinytouch_update, "main", return_value=0) as update:
             self.assertEqual(tt.main(["--port", "/dev/null", "update", "0.1.34", "--check"]), 0)
-        update.assert_called_once_with(["0.1.34", "--check", "--port", "/dev/null"])
+            self.assertEqual(tt.main(["update", "0.1.33", "--allow-downgrade"]), 0)
+        self.assertEqual(update.call_args_list,
+                         [mock.call(["0.1.34", "--check", "--port", "/dev/null"]),
+                          mock.call(["0.1.33", "--allow-downgrade"])])
 
 
 if __name__ == "__main__":
