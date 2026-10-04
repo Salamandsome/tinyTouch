@@ -1,8 +1,8 @@
 # tinyTouch on Linux
 
 An unofficial Linux port, maintained in a fork; upstream tinyTouch does not support it. Host
-support is in progress. Needs Python 3.9 or newer; `tinytouch_update.py` (and `tinytouch.py
-update`) also needs `python-cryptography`.
+support is in progress. Needs Python 3.9 or newer (3.10 for the sudo verifier);
+`tinytouch_update.py` (and `tinytouch.py update`) also needs `python-cryptography`.
 
 ## Device access
 
@@ -96,6 +96,131 @@ What cannot be undone:
 
 An enrollment that is interrupted (Ctrl-C, timeout, unplug) is rolled back by the device; the
 other fingers are not changed.
+
+## Fingerprint for sudo
+
+With this set up, `sudo` asks for a touch on the tinyTouch before it asks for your password. The
+check is done by `tinytouch_piv.py`, run by PAM's stock `pam_exec` module: it sends the device's
+smart card a fresh random challenge, which the card signs with its 9A key only in the few
+seconds after an enrolled finger touched the sensor, and checks the signature against the public
+key paired with your user. The password always works too. Needs Python 3.10 or newer,
+`python-pyscard` and `python-cryptography`, and the smart-card setup above.
+
+### Install
+
+Root runs the verifier, so it is installed as a root-owned copy outside this checkout; it never
+runs from the checkout as root.
+
+    sudo install -d -m 0755 /usr/local/lib/tinytouch /etc/tinytouch /etc/tinytouch/keys
+    sudo install -m 0755 linux/tinytouch_piv.py /usr/local/lib/tinytouch/tinytouch-verify
+    sudo install -m 0644 linux/tinytouch_serial.py /usr/local/lib/tinytouch/
+
+Repeat the two `install` lines after updating the checkout.
+
+### Pair
+
+Pairing records the device's public key as yours in `/etc/tinytouch/keys/USER.pem`:
+
+    sudo /usr/local/lib/tinytouch/tinytouch-verify --enrol --user "$USER"
+
+(`sudo python3 linux/tinytouch.py pair --user "$USER"` does the same by starting the installed
+copy.) It refuses unless `status --check` passes, the device has keys and at least one finger
+is enrolled, and the serial port is free. It shows the key's SHA-256 fingerprint and asks for one
+touch, checked exactly as `sudo` will check it. A key already paired with another user is
+refused. An earlier key file for the same user is replaced, and its copy kept under
+`/var/lib/tinytouch/backup/<UTC time>/keys/`. After a factory reset the device has new keys:
+pair again.
+
+To try it without touching PAM (exit status 0 means verified):
+
+    sudo env PAM_TYPE=auth PAM_USER="$USER" PAM_SERVICE=tinytouch-test /usr/local/lib/tinytouch/tinytouch-verify --timeout 10; echo $status
+
+(`$?` instead of `$status` in bash.)
+
+### The sudo PAM file
+
+On Arch, `/etc/pam.d/sudo` belongs to the `sudo` package as a backup file: an upgrade then
+leaves its new version beside it as `sudo.pacnew`, and `pacman -Qkk sudo` reports it modified.
+Before changing it, open a root shell in another terminal (`sudo -i`) and keep it open until
+`sudo` has been tried in a new terminal. Save the current file outside `/etc/pam.d`:
+
+    sudo sh -c 'd=/var/lib/tinytouch/backup/$(date -u +%Y%m%dT%H%M%SZ) && install -d -m 0700 "$d" && cp -p /etc/pam.d/sudo "$d/sudo" && echo "$d"'
+
+Then, from the root shell, edit `/etc/pam.d/sudo` so it reads (the stock file plus the two lines
+after the first):
+
+    #%PAM-1.0
+    auth		requisite	pam_faillock.so preauth
+    auth		sufficient	pam_exec.so quiet quiet_log stdout seteuid /usr/local/lib/tinytouch/tinytouch-verify --timeout 10
+    auth		include		system-auth
+    account		include		system-auth
+    session		include		system-auth
+    session		optional	pam_systemd.so class=none
+
+`requisite pam_faillock.so preauth` makes a locked-out user (five wrong passwords) fail before
+the touch is offered. `sufficient pam_exec.so` lets a verified touch complete the
+authentication; any other outcome goes on to the password. `quiet_log` keeps `pam_exec` from
+logging each fallback to the password as an error.
+
+### What happens
+
+- With the device plugged in and paired, `sudo` shows
+  `Touch tinyTouch to approve sudo, or press Enter for password.` A touch with an enrolled finger
+  approves the command. Enter goes straight to the password prompt. After 10 seconds without
+  either, the password prompt appears.
+- Device unplugged, or not paired with you: the password prompt appears at once.
+- A touch made before the prompt appeared is not used; the verifier says
+  `An earlier touch was ignored; touch again.` One touch approves one request.
+- After a wrong password, `sudo` runs the stack again, so the touch is offered again for another
+  10 seconds.
+- A touch starts sudo's timestamp exactly as a password does: later `sudo` commands in the same
+  terminal don't ask again for a while.
+- During a faillock lockout `sudo` refuses silently, before the touch line, until the lockout
+  ends. A timeout or Enter never counts as a failed attempt, and a touch does not reset the
+  count of wrong passwords.
+- `sudo` in an SSH session, and `sudo` with no terminal (`sudo -n`, scripts, background jobs),
+  never offer the touch: they go straight to the password, or fail.
+- If the verifier fails in any way, it is killed after 15 seconds at most, or exits when `sudo`
+  is interrupted; either way the password prompt (or nothing, after Ctrl-C) follows.
+
+Each run logs one line to the system journal: `journalctl -t tinytouch-verify`.
+
+### Undo
+
+From the root shell, put the saved file back:
+
+    cp /var/lib/tinytouch/backup/<UTC time>/sudo /etc/pam.d/sudo
+
+and check that it is the packaged file again: the two hashes match, `cmp` prints nothing, and
+`pacman -Qkk sudo` (as root) no longer mentions `/etc/pam.d/sudo`:
+
+    md5sum /etc/pam.d/sudo
+    sed -n '/%BACKUP%/,$p' /var/lib/pacman/local/sudo-*/files | grep pam.d/sudo
+    cmp /etc/pam.d/sudo /var/lib/tinytouch/backup/<UTC time>/sudo
+    pacman -Qkk sudo
+
+To remove everything: `rm -r /usr/local/lib/tinytouch /etc/tinytouch/keys`.
+
+If `sudo` stops working and no root shell is open: `run0` (systemd's own elevation, which uses
+polkit rather than sudo's PAM file) gives a root shell, as does logging in as root on a text
+console (Ctrl-Alt-F3) if root has a password.
+
+### Limits
+
+- This is our own code in the authentication path. It is small, single-file and fails toward
+  the password, but it has not had an outside review.
+- The fingerprint sensor has no liveness detection, and its false-match rate is not published.
+- Wrong fingers are not counted or rate-limited by the host, which cannot see them; the device
+  only waits 800 ms between attempts.
+- A factory reset makes new keys (the touch then stops working until you pair again) and turns
+  `piv_auto_type` back on (`status --check` reports it).
+- A `tinytouch.py` command that asks for a touch also lets the card sign for 30 seconds without
+  a new one. The verifier uses up or rejects such signatures, so `sudo` still needs its own
+  touch; with no finger enrolled, that command needs no touch at all.
+- If the verifier ever hangs and its 15-second watchdog kills it, the terminal may be left not
+  showing what you type; `stty sane` (typed blind) or `reset` fixes it.
+- Two prompts waiting at once (two terminals, or `sudo` and a polkit dialog) race for one touch:
+  whichever asks first after the touch gets it.
 
 The tests are run by hand, from the repository root:
 

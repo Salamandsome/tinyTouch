@@ -29,6 +29,9 @@ CHECKS = (("protocol", "6"), ("mode", "piv"), ("piv_auto_type", "0"), ("piv_touc
 SUMMARY = ("firmware", "build", "protocol", "mode", "piv", "sensor", "fingerprints", "ota",
            "piv_auto_type", "piv_touch", "piv_visible")
 
+# Pairing runs only from this root-owned copy of tinytouch_piv.py (linux/README.md).
+VERIFIER = "/usr/local/lib/tinytouch/tinytouch-verify"
+
 COLORS = {"off": 0, "blue": 1, "green": 2, "cyan": 3, "red": 4, "purple": 5, "yellow": 6,
           "white": 7}
 ON_OFF = {"off": 0, "on": 1}
@@ -419,6 +422,20 @@ def cmd_update(args: argparse.Namespace) -> int:
                                  + (["--port", args.port] if args.port else []))
 
 
+def cmd_pair(args: argparse.Namespace) -> int:
+    """Hand over to the installed verifier's --enrol: root writes /etc/tinytouch/keys only from
+    code it owns, never from this user-writable checkout."""
+    if not os.path.isfile(VERIFIER):
+        raise CliError(f"{VERIFIER} is not installed. Pairing runs only from that root-owned "
+                       "copy, never from this checkout as root; install it first "
+                       "(linux/README.md, Fingerprint for sudo)")
+    try:
+        os.execv(VERIFIER, [VERIFIER, "--enrol", "--user", args.user])
+    except OSError as exc:
+        raise CliError(f"cannot run {VERIFIER}: {exc.strerror}") from None
+    return 1  # not reached: execv replaced this process
+
+
 def finger(text: str) -> int:
     if not (text.isdecimal() and 1 <= int(text) <= FINGERS):
         raise argparse.ArgumentTypeError(f"a finger number from 1 to {FINGERS}")
@@ -458,6 +475,8 @@ def parser() -> argparse.ArgumentParser:
     sub.add_argument("--check", action="store_true", help="verify only; write nothing")
     sub.add_argument("--allow-downgrade", action="store_true",
                      help="install a release older than the device's firmware")
+    sub = add("pair", cmd_pair, "as root: pair the attached tinyTouch with a user for sudo")
+    sub.add_argument("--user", required=True, help="the user whose touch it approves")
     return top
 
 

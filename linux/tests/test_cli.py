@@ -4,6 +4,7 @@ import importlib
 import io
 import json
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -52,7 +53,7 @@ class ParserTest(CliTest):
     def test_only_the_safe_commands_exist(self):
         self.assertEqual(set(tt.parser()._subparsers._group_actions[0].choices),
                          {"status", "logs", "fingers", "enroll", "delete", "piv-create",
-                          "config", "update"})
+                          "config", "update", "pair"})
 
     def test_no_device(self):
         self.assertEqual(self.run_cli("status", device=False), 1)
@@ -386,6 +387,29 @@ class UpdateTest(CliTest):
         self.assertEqual(update.call_args_list,
                          [mock.call(["0.1.34", "--check", "--port", "/dev/null"]),
                           mock.call(["0.1.33", "--allow-downgrade"])])
+
+
+class PairTest(CliTest):
+    def test_execs_the_installed_verifier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            verifier = Path(tmp) / "tinytouch-verify"
+            verifier.write_text("")
+            with mock.patch.object(tt, "VERIFIER", str(verifier)), \
+                    mock.patch.object(tt.os, "execv") as execv:
+                tt.main(["pair", "--user", "someone"])
+        execv.assert_called_once_with(str(verifier),
+                                      [str(verifier), "--enrol", "--user", "someone"])
+
+    def test_refuses_without_the_installed_verifier(self):
+        with mock.patch.object(tt, "VERIFIER", "/nonexistent/tinytouch-verify"), \
+                mock.patch.object(tt.os, "execv") as execv:
+            self.assertEqual(self.run_cli("pair", "--user", "someone", device=False), 1)
+        self.assertIn("never from this checkout", self.err)
+        execv.assert_not_called()
+
+    def test_user_is_required(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            tt.main(["pair"])
 
 
 if __name__ == "__main__":
