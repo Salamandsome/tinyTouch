@@ -20,7 +20,11 @@ VENDOR, PRODUCT, NAME = "0x303A", "0x4001", "tinyTouch"
 
 def add_tinytouch(plist: dict) -> dict:
     """The driver's Info.plist with the tinyTouch in its three parallel reader lists."""
-    ids = list(zip(plist["ifdVendorID"], plist["ifdProductID"], plist["ifdFriendlyName"]))
+    lists = plist["ifdVendorID"], plist["ifdProductID"], plist["ifdFriendlyName"]
+    if len({len(entries) for entries in lists}) != 1:
+        # pcscd treats unequal lengths as fatal and loads no driver at all.
+        raise ValueError("the driver's reader lists have different lengths")
+    ids = list(zip(*lists))
     if (VENDOR, PRODUCT, NAME) not in ids:
         ids.append((VENDOR, PRODUCT, NAME))
     plist = dict(plist)
@@ -31,14 +35,14 @@ def add_tinytouch(plist: dict) -> dict:
 def make_bundle(target: Path, system: Path = SYSTEM_BUNDLE) -> Path:
     """Write <target>/ifd-ccid.bundle from <system>; returns the bundle path."""
     with open(system / "Contents" / "Info.plist", "rb") as handle:
-        plist = plistlib.load(handle)
+        plist = add_tinytouch(plistlib.load(handle))
     binary = system / "Contents" / "Linux" / plist["CFBundleExecutable"]
     if not binary.is_file():
         raise FileNotFoundError(binary)
     bundle = target / system.name
     (bundle / "Contents" / "Linux").mkdir(parents=True, exist_ok=True)
     with open(bundle / "Contents" / "Info.plist", "wb") as handle:
-        plistlib.dump(add_tinytouch(plist), handle)
+        plistlib.dump(plist, handle)
     link = bundle / "Contents" / "Linux" / binary.name
     if link.is_symlink() or link.exists():
         link.unlink()
@@ -53,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         bundle = make_bundle(args.target)
-    except (OSError, KeyError, plistlib.InvalidFileException) as exc:
+    except (OSError, KeyError, ValueError, plistlib.InvalidFileException) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"Wrote {bundle} with the tinyTouch added.")

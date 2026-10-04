@@ -41,6 +41,20 @@ class BundleTest(unittest.TestCase):
             self.assertTrue(link.is_symlink())
             self.assertEqual(link.resolve(), (system / "Contents" / "Linux" / "libccid.so"))
 
+    def test_mismatched_reader_lists_are_refused(self):
+        # pcscd aborts its whole driver scan on lists of unequal length: no reader would work.
+        with tempfile.TemporaryDirectory() as tmp:
+            system = fake_system_bundle(Path(tmp) / "sys")
+            plist_path = system / "Contents" / "Info.plist"
+            with open(plist_path, "rb") as handle:
+                plist = plistlib.load(handle)
+            plist["ifdProductID"].append("0x0001")
+            with open(plist_path, "wb") as handle:
+                plistlib.dump(plist, handle)
+            with self.assertRaisesRegex(ValueError, "lengths"):
+                mdb.make_bundle(Path(tmp) / "out", system)
+            self.assertFalse((Path(tmp) / "out").exists())
+
     def test_missing_driver_binary_is_an_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = fake_system_bundle(Path(tmp) / "sys")
