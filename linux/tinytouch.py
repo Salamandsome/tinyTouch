@@ -423,17 +423,21 @@ def cmd_update(args: argparse.Namespace) -> int:
 
 
 def cmd_pair(args: argparse.Namespace) -> int:
-    """Hand over to the installed verifier's --enrol: root writes /etc/tinytouch/keys only from
-    code it owns, never from this user-writable checkout."""
+    """Hand over, through sudo, to the installed verifier's --enrol: root writes
+    /etc/tinytouch/keys only from code it owns, never from this user-writable checkout, so this
+    command itself refuses to run as root."""
+    if os.geteuid() == 0:
+        raise CliError("run `tinytouch.py pair` as yourself, not as root: it starts the installed "
+                       "verifier through sudo, so no code from this checkout runs as root")
     if not os.path.isfile(VERIFIER):
         raise CliError(f"{VERIFIER} is not installed. Pairing runs only from that root-owned "
                        "copy, never from this checkout as root; install it first "
                        "(linux/README.md, Fingerprint for sudo)")
     try:
-        os.execv(VERIFIER, [VERIFIER, "--enrol", "--user", args.user])
+        os.execvp("sudo", ["sudo", VERIFIER, "--enrol", "--user", args.user])
     except OSError as exc:
-        raise CliError(f"cannot run {VERIFIER}: {exc.strerror}") from None
-    return 1  # not reached: execv replaced this process
+        raise CliError(f"cannot run sudo: {exc.strerror}") from None
+    return 1  # not reached: execvp replaced this process
 
 
 def finger(text: str) -> int:
@@ -475,7 +479,7 @@ def parser() -> argparse.ArgumentParser:
     sub.add_argument("--check", action="store_true", help="verify only; write nothing")
     sub.add_argument("--allow-downgrade", action="store_true",
                      help="install a release older than the device's firmware")
-    sub = add("pair", cmd_pair, "as root: pair the attached tinyTouch with a user for sudo")
+    sub = add("pair", cmd_pair, "pair the attached tinyTouch with a user for sudo (asks sudo)")
     sub.add_argument("--user", required=True, help="the user whose touch it approves")
     return top
 

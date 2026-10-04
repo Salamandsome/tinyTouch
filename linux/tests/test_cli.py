@@ -390,22 +390,39 @@ class UpdateTest(CliTest):
 
 
 class PairTest(CliTest):
-    def test_execs_the_installed_verifier(self):
+    def test_runs_the_installed_verifier_through_sudo(self):
         with tempfile.TemporaryDirectory() as tmp:
             verifier = Path(tmp) / "tinytouch-verify"
             verifier.write_text("")
             with mock.patch.object(tt, "VERIFIER", str(verifier)), \
+                    mock.patch.object(tt.os, "geteuid", lambda: 1000), \
+                    mock.patch.object(tt.os, "execvp") as execvp, \
                     mock.patch.object(tt.os, "execv") as execv:
                 tt.main(["pair", "--user", "someone"])
-        execv.assert_called_once_with(str(verifier),
-                                      [str(verifier), "--enrol", "--user", "someone"])
+        execvp.assert_called_once_with(
+            "sudo", ["sudo", str(verifier), "--enrol", "--user", "someone"])
+        execv.assert_not_called()
+
+    def test_refuses_to_run_as_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            verifier = Path(tmp) / "tinytouch-verify"
+            verifier.write_text("")
+            with mock.patch.object(tt, "VERIFIER", str(verifier)), \
+                    mock.patch.object(tt.os, "geteuid", lambda: 0), \
+                    mock.patch.object(tt.os, "execvp") as execvp, \
+                    mock.patch.object(tt.os, "execv") as execv:
+                self.assertEqual(self.run_cli("pair", "--user", "someone", device=False), 1)
+        self.assertIn("not as root", self.err)
+        execvp.assert_not_called()
+        execv.assert_not_called()
 
     def test_refuses_without_the_installed_verifier(self):
         with mock.patch.object(tt, "VERIFIER", "/nonexistent/tinytouch-verify"), \
-                mock.patch.object(tt.os, "execv") as execv:
+                mock.patch.object(tt.os, "geteuid", lambda: 1000), \
+                mock.patch.object(tt.os, "execvp") as execvp:
             self.assertEqual(self.run_cli("pair", "--user", "someone", device=False), 1)
         self.assertIn("never from this checkout", self.err)
-        execv.assert_not_called()
+        execvp.assert_not_called()
 
     def test_user_is_required(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
