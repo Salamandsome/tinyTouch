@@ -2,12 +2,15 @@
 /etc): pam_permit, pam_deny, pam_echo for the conversation, and pam_exec as the verifier's PAM
 line uses it."""
 
-import os
+import ctypes
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 HARNESS = Path(__file__).resolve().parents[1] / "tools" / "pam_harness.py"
 SERVICE = "tinytouch-harness-test"
@@ -41,6 +44,38 @@ class HarnessTest(unittest.TestCase):
         pam, _ = pam_harness.load()
         for name in ("pam_start_confdir", "pam_authenticate", "pam_end", "pam_set_item"):
             self.assertTrue(hasattr(pam, name))
+
+    def test_conversation_error_is_reported_and_freed(self):
+        sys.path.insert(0, str(HARNESS.parent))
+        try:
+            import pam_harness as ph
+        finally:
+            sys.path.remove(str(HARNESS.parent))
+        _, real = ph.load()
+        freed = []
+
+        class Libc:
+            calloc, strdup = real.calloc, real.strdup
+
+            @staticmethod
+            def free(pointer):
+                freed.append(pointer)
+                real.free(pointer)
+        callback = ph.converse(Libc())
+        prompts = [ph.Message(ph.PAM_PROMPT_ECHO_OFF, b"Password: "),
+                   ph.Message(ph.PAM_PROMPT_ECHO_ON, b"Name: ")]
+        messages = (ctypes.POINTER(ph.Message) * 2)(*(ctypes.pointer(m) for m in prompts))
+        responses = ctypes.POINTER(ph.Response)()
+        err = io.StringIO()
+        with mock.patch.object(ph.getpass, "getpass", return_value="secret"), \
+                mock.patch.object(ph, "input", side_effect=RuntimeError("broken"), create=True), \
+                redirect_stderr(err):
+            result = callback(2, ctypes.cast(messages, ctypes.POINTER(ctypes.POINTER(ph.Message))),
+                              ctypes.pointer(responses), None)
+        self.assertEqual(result, ph.PAM_CONV_ERR)
+        self.assertIn("RuntimeError", err.getvalue())
+        self.assertEqual(len(freed), 2)  # the first answer's copy, then the array
+        self.assertFalse(responses)  # nothing handed to libpam
 
     def test_permit(self):
         done = self.run_stack("auth required pam_permit.so\n")

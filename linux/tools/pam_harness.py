@@ -45,6 +45,8 @@ def load():
     libc.calloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
     libc.strdup.restype = ctypes.c_void_p
     libc.strdup.argtypes = [ctypes.c_char_p]
+    libc.free.restype = None
+    libc.free.argtypes = [ctypes.c_void_p]
     handle = ctypes.c_void_p
     pam.pam_start_confdir.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
                                       ctypes.POINTER(Conversation), ctypes.c_char_p,
@@ -60,8 +62,11 @@ def load():
 
 
 def converse(libc, out=sys.stdout):
-    """The conversation callback. libpam frees the responses, so they are malloc'd."""
+    """The conversation callback. libpam frees the responses, so they are malloc'd. An error
+    in the callback must not escape into ctypes (it would return garbage to libpam): it is
+    printed, what was allocated is freed, and libpam gets PAM_CONV_ERR."""
     def conv(count, messages, responses, appdata):
+        replies = None
         try:
             replies = libc.calloc(count, ctypes.sizeof(Response))
             if not replies:
@@ -81,7 +86,18 @@ def converse(libc, out=sys.stdout):
                 array[i].resp = libc.strdup(answer.encode())
             responses[0] = array
             return PAM_SUCCESS
-        except (EOFError, KeyboardInterrupt, OSError):
+        except (Exception, KeyboardInterrupt) as exc:
+            try:
+                print(f"error: conversation failed ({type(exc).__name__})", file=sys.stderr,
+                      flush=True)
+            except Exception:
+                pass
+            if replies:
+                array = ctypes.cast(replies, ctypes.POINTER(Response))
+                for i in range(count):
+                    if array[i].resp:
+                        libc.free(array[i].resp)
+                libc.free(replies)
             return PAM_CONV_ERR
     return CONV_FUNC(conv)
 
