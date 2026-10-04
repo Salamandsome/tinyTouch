@@ -1,0 +1,11 @@
+# Keep the tinyTouch out of USB autosuspend. The firmware reconnects over USB whenever the device
+# wakes from suspend, which drops the smart card and the serial port for about a second.
+# ccid's 92_pcscd_ccid.rules sets power/control=auto for every CCID-class device, so this must
+# sort after it.
+
+ACTION=="remove", GOTO="tinytouch_power_end"
+
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="303a", ATTR{idProduct}=="4001", \
+  ATTR{manufacturer}=="tinyTouch", ATTR{product}=="tinyTouch", ATTR{power/control}="on"
+
+LABEL="tinytouch_power_end"

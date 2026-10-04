@@ -1,12 +1,9 @@
 # tinyTouch, stock firmware: USB 303a:4001, manufacturer and product "tinyTouch".
 # 303a:4001 is Espressif's TinyUSB default ID, so the strings are matched too.
-# Numbered below 73 so systemd-logind's uaccess pass sees the tag.
+# Numbered below 73 so systemd-logind's uaccess pass sees the tag. The device's USB power
+# setting is in 93-tinytouch-power.rules, which must run after ccid's 92 rule.
 
 ACTION=="remove", GOTO="tinytouch_end"
-
-# Keep the device out of USB autosuspend so the serial link and the touch window are not cut.
-SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="303a", ATTR{idProduct}=="4001", \
-  ATTR{manufacturer}=="tinyTouch", ATTR{product}=="tinyTouch", ATTR{power/control}="on"
 
 # Serial (CDC-ACM) port: the logged-in user gets access; ModemManager leaves it alone.
 SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="4001", \

@@ -6,15 +6,18 @@ update`) also needs `python-cryptography`.
 
 ## Device access
 
-`udev/70-tinytouch.rules` gives the logged-in user the device's serial port, keeps ModemManager
-off it and the device out of USB autosuspend:
+`udev/70-tinytouch.rules` gives the logged-in user the device's serial port and keeps
+ModemManager off it. `udev/93-tinytouch-power.rules` keeps the device out of USB autosuspend:
+the firmware reconnects over USB whenever the device wakes from suspend, dropping the smart card
+and the serial port for about a second, and the `ccid` package's own rule would otherwise
+re-enable autosuspend for it.
 
-    sudo install -m 0644 linux/udev/70-tinytouch.rules /etc/udev/rules.d/
+    sudo install -m 0644 linux/udev/70-tinytouch.rules linux/udev/93-tinytouch-power.rules /etc/udev/rules.d/
     sudo udevadm control --reload
 
 then replug the tinyTouch. To remove the rule:
 
-    sudo rm /etc/udev/rules.d/70-tinytouch.rules && sudo udevadm control --reload
+    sudo rm /etc/udev/rules.d/70-tinytouch.rules /etc/udev/rules.d/93-tinytouch-power.rules && sudo udevadm control --reload
 
 ## Updating the firmware
 
@@ -41,13 +44,11 @@ points there; nothing under `/usr` is changed.
     sudo python3 linux/pcsc/make-driver-bundle.py /etc/tinytouch/pcsc-drivers
     sudo install -D -m 0644 linux/pcsc/pcscd-tinytouch.conf /etc/systemd/system/pcscd.service.d/tinytouch.conf
     sudo systemctl daemon-reload
+    sudo systemctl restart pcscd.service
 
-Re-run the first `python3` line after a `ccid` upgrade. `pcsc_scan -r` then lists the reader and
+Re-run the `python3` line after a `ccid` upgrade, then restart `pcscd.service` again. `pcsc_scan -r` then lists the reader and
 `pkcs15-tool --list-certificates` shows the two certificates. To undo: remove the drop-in and
 `/etc/tinytouch/pcsc-drivers`, run `daemon-reload`, and `disable --now pcscd.socket`.
-
-The firmware reconnects over USB whenever the device wakes from USB suspend, which drops the
-smart card and the serial port for about a second. The udev rule keeps the device awake.
 
 ## Setting up the device
 
