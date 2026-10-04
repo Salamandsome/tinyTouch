@@ -3,8 +3,9 @@
 
 `pam_exec ... stdout seteuid` runs this once per authentication. It asks the tinyTouch's PIV card
 to sign a fresh challenge with its 9A key, which the firmware allows only for a few seconds after
-an enrolled finger touches the sensor, and checks the signature against the public key enrolled
-for the user. Exit 0 means verified; any other exit sends PAM on to the password.
+an enrolled finger touches the sensor, checks the signature against the public key enrolled for
+the user, and checks that the card's window was a touch's (see await_touch). Exit 0 means
+verified; any other exit sends PAM on to the password.
 
     tinytouch-verify [--timeout S]          from PAM (S=10 for sudo; 0 waits until PAM goes)
     tinytouch-verify --enrol --user NAME    as root: pair the attached tinyTouch with NAME
@@ -58,7 +59,7 @@ import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from cryptography import x509  # noqa: E402
-from cryptography.exceptions import InvalidSignature  # noqa: E402
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm  # noqa: E402
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import padding, rsa  # noqa: E402
 
@@ -97,6 +98,7 @@ GET_CERT_9A = bytes.fromhex("00cb3fff055c035fc10500")  # GET DATA 5FC105, Le 256
 SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
 SIGNED_HEADER = bytes.fromhex("7c82010482820100")  # 7C{82 <256-byte signature>}
 REFUSED, DONE = 0x6982, 0x9000  # no touch window open; success
+SLOT_9A, SLOT_9D = 0x9A, 0x9D  # PIV authentication; key management (piv.c, both RSA-2048)
 MAX_GET_RESPONSE = 8
 CERT_LIMIT, SIGNED_LIMIT = 4096, 512
 KEY_FILE_LIMIT = 65536
@@ -190,6 +192,8 @@ def remote_session() -> bool:
         return False
     except OSError:
         return True
+    # Best effort: an SSH login has its own logind session, but a multiplexer (tmux, screen)
+    # started at the desk and attached over SSH runs in the desk's session and counts as local.
     found = re.search(r"/session-([A-Za-z0-9]+)\.scope(?:/|$)", cgroup, re.M)
     if not found:
         return False  # not in a login session (polkit's helper runs as a service)
@@ -460,23 +464,23 @@ class Card:
             return None
         try:
             key = x509.load_der_x509_certificate(certificate_from_object(data)).public_key()
-        except (Malformed, ValueError):
+        except (Malformed, ValueError, UnsupportedAlgorithm):
             return None
         if not isinstance(key, rsa.RSAPublicKey) or key.key_size != 2048:
             return None
         return spki(key)
 
-    def sign(self, block: bytes) -> tuple[int, bytes]:
-        """GENERAL AUTHENTICATE on 9A with 7C{82 00, 81 <block>}, in CLA 10 chained parts of at
-        most 255 bytes, the last with CLA 00 and Le 00."""
+    def sign(self, block: bytes, slot: int = SLOT_9A) -> tuple[int, bytes]:
+        """GENERAL AUTHENTICATE on `slot` (9A, or 9D: also RSA-2048) with 7C{82 00, 81 <block>},
+        in CLA 10 chained parts of at most 255 bytes, the last with CLA 00 and Le 00."""
         inner = b"\x82\x00\x81\x82\x01\x00" + block
         payload = b"\x7c\x82" + len(inner).to_bytes(2, "big") + inner
         while len(payload) > 255:
-            _, sw = self.transmit(bytes([0x10, 0x87, 0x07, 0x9A, 255]) + payload[:255])
+            _, sw = self.transmit(bytes([0x10, 0x87, 0x07, slot, 255]) + payload[:255])
             if sw != DONE:
                 raise Malformed("chaining refused")
             payload = payload[255:]
-        data, sw = self.command(bytes([0x00, 0x87, 0x07, 0x9A, len(payload)]) + payload + b"\x00",
+        data, sw = self.command(bytes([0x00, 0x87, 0x07, slot, len(payload)]) + payload + b"\x00",
                                 SIGNED_LIMIT)
         return sw, data
 
@@ -540,18 +544,34 @@ def find_card(context: int, keys: dict[bytes, rsa.RSAPublicKey],
         wait_for_readers(context, min(left, 0.25))
 
 
-def challenge(card: Card, check_kind: bool) -> tuple[bytes, int, bytes, int | None]:
-    """One attempt: (nonce, status, reply, status of the window-kind probe or None). The probe
-    is a second GA 9A in the same transaction: a touch window allows one 9A operation and
-    refuses it without consuming anything (piv.c, slot_already_used); the serial AUTH window
-    allows repeats and signs it."""
+def challenge(card: Card, check_kind: bool) -> tuple[bytes, int, bytes, str | None]:
+    """One attempt: (nonce, status, reply, window kind or None). With `check_kind`, a signature
+    is followed in the same transaction by two probes, each on a fresh random block, that tell
+    the window that signed it (piv.c handle_general_authenticate):
+
+    - a touch window (piv_note_user_presence) grants two operations, one per slot: the 9A probe
+      is refused without consuming anything (slot_already_used), and the 9D probe signs;
+    - the serial AUTH window (piv_note_configuration_presence) allows repeated slots: with an
+      operation left it signs the 9A probe; with none (the main challenge took the last) the
+      window is closed and refuses the 9D probe too.
+
+    Returns "touch" (9A refused, 9D signed with a well-formed reply, whose value is discarded),
+    "auth" (9A probe signed) or "other" (anything else)."""
     nonce = os.urandom(32)
     kind = None
     with card.transaction():
         card.select()
         sw, reply = card.sign(challenge_block(nonce))
         if sw == DONE and check_kind:
-            kind, _ = card.sign(challenge_block(os.urandom(32)))
+            again, _ = card.sign(challenge_block(os.urandom(32)))
+            if again == DONE:
+                kind = "auth"
+            elif again != REFUSED:
+                kind = "other"
+            else:
+                other, other_reply = card.sign(challenge_block(os.urandom(32)), SLOT_9D)
+                well_formed = len(other_reply) == 264 and other_reply.startswith(SIGNED_HEADER)
+                kind = "touch" if other == DONE and well_formed else "other"
     return nonce, sw, reply, kind
 
 
@@ -593,7 +613,10 @@ def await_touch(card: Card, key: rsa.RSAPublicKey, waiter: Waiter, prompt: str,
     """The fresh-touch rule. The first full challenge goes out before the prompt: a signature
     then comes from a window opened earlier (a stray touch, the CLI's AUTH) and is discarded.
     The probe must be full-size, because the firmware spends the window before it checks the
-    length. A signature counts only after the card has refused at least once in this run."""
+    length. A signature counts only after the card has refused at least once in this run (a
+    Retry is not a refusal), and only from a touch window (challenge): an AUTH window with an
+    operation left is rejected as `auth_window`, one with none left, or a touch window whose 9D
+    operation someone else already used, as `window_kind`."""
     refused = prompted = False
     while True:
         try:
@@ -613,10 +636,10 @@ def await_touch(card: Card, key: rsa.RSAPublicKey, waiter: Waiter, prompt: str,
                 key.verify(reply[8:], nonce, padding.PKCS1v15(), hashes.SHA256())
             except InvalidSignature:
                 return BAD_SIGNATURE, "bad_signature"
-            if kind == DONE:
+            if kind == "auth":
                 return BAD_SIGNATURE, "auth_window"
-            if kind != REFUSED:
-                return BAD_SIGNATURE, "malformed"
+            if kind != "touch":
+                return BAD_SIGNATURE, "window_kind"
             return OK, "verified"
         elif sw is not None:
             return BAD_SIGNATURE, "malformed"
@@ -734,7 +757,9 @@ def port_in_use(path: str) -> bool:
 
 def serial_module():
     """tinytouch_serial, installed beside this file (python -I leaves its directory off the
-    path; the directory was checked to be root-owned before this runs)."""
+    path; the directory and the file were checked to be root-owned before this runs). Root
+    writes no bytecode cache beside it."""
+    sys.dont_write_bytecode = True
     try:
         return importlib.import_module("tinytouch_serial")
     except ImportError:
@@ -745,6 +770,13 @@ def serial_module():
 def device_problems() -> list[str]:
     """Why the attached device may not be paired: the `status --check` conditions, keys, and at
     least one enrolled finger (with none, the serial AUTH grants windows without a touch)."""
+    try:
+        trusted = read_trusted(SELF.parent / "tinytouch_serial.py", 0o644) is not None
+    except ConfigError:
+        trusted = False
+    if not trusted:
+        return ["tinytouch_serial.py is not installed beside the verifier as a root-owned "
+                "file of mode 644 (repeat the install lines in linux/README.md)"]
     try:
         ts = serial_module()
     except ImportError:
@@ -967,6 +999,8 @@ def parser() -> Parser:
 
 def main(argv: list[str], env: dict, *, guarded: bool = False) -> int:
     """Run once; `guarded` adds the watchdog and parent-death signal (the installed program)."""
+    fields = {"service": env.get("PAM_SERVICE", ""), "user": env.get("PAM_USER", ""),
+              "tty": env.get("PAM_TTY", "")}
     try:
         try:
             args = parser().parse_args(argv)
@@ -986,9 +1020,10 @@ def main(argv: list[str], env: dict, *, guarded: bool = False) -> int:
             guard(timeout)
         return verify(timeout, env)
     except ParentGone:
+        log(syslog.LOG_NOTICE, **fields, result=RESULTS[PASSWORD], reason="parent_gone")
         return PASSWORD
     except BaseException as exc:
-        log(syslog.LOG_ERR, result=RESULTS[INTERNAL], error=type(exc).__name__)
+        log(syslog.LOG_ERR, **fields, result=RESULTS[INTERNAL], error=type(exc).__name__)
         return INTERNAL
 
 

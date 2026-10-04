@@ -5,7 +5,8 @@ The card follows firmware/tiny_touch_unified/main/piv.c: piv_handle_apdu_locked 
 command chaining), handle_select, handle_get_data and respond_maybe_chunked (61xx), and
 handle_general_authenticate with the user-presence window of piv_note_user_presence (a touch:
 10 s, two operations, one per slot) or piv_note_configuration_presence (serial AUTH: 30 s, eight
-operations, slots may repeat).
+operations, slots may repeat). Both slots hold an RSA-2048 key, as piv_init requires: 9A (`key`,
+the one the certificate names) and 9D (`key_9d`).
 """
 
 import datetime
@@ -71,8 +72,9 @@ class Window:
 
 
 class FakeCard:
-    def __init__(self, key=None, cert: bytes | None = None):
+    def __init__(self, key=None, cert: bytes | None = None, key_9d=None):
         self.key = key or shared_key()
+        self._key_9d = key_9d
         self.cert = self_signed(self.key) if cert is None else cert
         self.window: Window | None = None
         self.chain = b""
@@ -88,6 +90,14 @@ class FakeCard:
         self.blocks: list[bytes] = []  # every challenge block received
         self.signatures: list[bytes] = []
         self.results: list[int] = []  # status word of each GA
+        self.ga_slots: list[int] = []  # P2 (0x9A or 0x9D) of each GA
+
+    @property
+    def key_9d(self):
+        """The 9D key, made on first use (generation is slow)."""
+        if self._key_9d is None:
+            self._key_9d = shared_key(3)
+        return self._key_9d
 
     # Presence, as touch_pin_hid.c handle_fingerprint_match and config_console.c authorize.
     def touch(self) -> None:
@@ -202,11 +212,14 @@ class FakeCard:
         elif event == "auth":
             self.auth()
         reply = self._general_authenticate(p1, p2, data)
+        self.ga_slots.append(p2)
         self.results.append(int.from_bytes(reply[-2:], "big"))
         return reply
 
     def _general_authenticate(self, p1: int, p2: int, data) -> bytes:
-        """handle_general_authenticate: the window is consumed before the length check."""
+        """handle_general_authenticate: the window is consumed before the length check. The
+        accounting is piv.c's: a slot already used is refused only without repeats, and the window
+        closes when no operation is left or, without repeats, when both slots are used."""
         if p1 != 0x07 or p2 not in (0x9A, 0x9D):
             return sw(0x6A86)
         if data is None:
@@ -228,8 +241,9 @@ class FakeCard:
             self.window = None
         if len(challenge) != 256:
             return sw(0x6700)
-        n = self.key.private_numbers().public_numbers.n
-        d = self.key.private_numbers().d
+        key = self.key_9d if p2 == 0x9D else self.key
+        n = key.private_numbers().public_numbers.n
+        d = key.private_numbers().d
         signature = pow(int.from_bytes(challenge, "big"), d, n).to_bytes(256, "big")
         self.signatures.append(signature)
         reply = b"\x7c\x82\x01\x04\x82\x82\x01\x00" + signature

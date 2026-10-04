@@ -1,8 +1,9 @@
 # tinyTouch on Linux
 
 An unofficial Linux port, maintained in a fork; upstream tinyTouch does not support it. Host
-support is in progress. Needs Python 3.9 or newer (3.10 for the sudo verifier);
-`tinytouch_update.py` (and `tinytouch.py update`) also needs `python-cryptography`.
+support is in progress. Everything under `linux/` needs Python 3.10 or newer (its `X | None`
+annotations are evaluated at runtime); `tinytouch_update.py` (and `tinytouch.py update`) also
+needs `python-cryptography`.
 
 ## Device access
 
@@ -121,10 +122,11 @@ Repeat the two `install` lines after updating the checkout.
 
 Pairing records the device's public key as yours in `/etc/tinytouch/keys/USER.pem`:
 
-    sudo /usr/local/lib/tinytouch/tinytouch-verify --enrol --user "$USER"
+    python3 linux/tinytouch.py pair --user "$USER"
 
-(`sudo python3 linux/tinytouch.py pair --user "$USER"` does the same by starting the installed
-copy.) It refuses unless `status --check` passes, the device has keys and at least one finger
+Run it as yourself: it calls `sudo` itself to start the installed copy
+(`sudo /usr/local/lib/tinytouch/tinytouch-verify --enrol --user NAME`, which can also be run
+directly), and refuses to run as root, so no code from the checkout runs as root. Pairing refuses unless `status --check` passes, the device has keys and at least one finger
 is enrolled, and the serial port is free. It shows the key's SHA-256 fingerprint and asks for one
 touch, checked exactly as `sudo` will check it. A key already paired with another user is
 refused. An earlier key file for the same user is replaced, and its copy kept under
@@ -167,7 +169,8 @@ logging each fallback to the password as an error.
 - With the device plugged in and paired, `sudo` shows
   `Touch tinyTouch to approve sudo, or press Enter for password.` A touch with an enrolled finger
   approves the command. Enter goes straight to the password prompt. After 10 seconds without
-  either, the password prompt appears.
+  either, the password prompt appears. Anything typed while the touch line is shown is not
+  echoed and is discarded: a password typed there must be typed again at the password prompt.
 - Device unplugged, or not paired with you: the password prompt appears at once.
 - A touch made before the prompt appeared is not used; the verifier says
   `An earlier touch was ignored; touch again.` One touch approves one request.
@@ -179,7 +182,10 @@ logging each fallback to the password as an error.
   ends. A timeout or Enter never counts as a failed attempt, and a touch does not reset the
   count of wrong passwords.
 - `sudo` in an SSH session, and `sudo` with no terminal (`sudo -n`, scripts, background jobs),
-  never offer the touch: they go straight to the password, or fail.
+  never offer the touch: they go straight to the password, or fail. SSH logins are recognised by
+  their systemd login session, so the check is best-effort: a terminal multiplexer (tmux,
+  screen) started at the desk and attached over SSH runs in the desk's session and counts as
+  local.
 - If the verifier fails in any way, it is killed after 15 seconds at most, or exits when `sudo`
   is interrupted; either way the password prompt (or nothing, after Ctrl-C) follows.
 
@@ -199,7 +205,10 @@ and check that it is the packaged file again: the two hashes match, `cmp` prints
     cmp /etc/pam.d/sudo /var/lib/tinytouch/backup/<UTC time>/sudo
     pacman -Qkk sudo
 
-To remove everything: `rm -r /usr/local/lib/tinytouch /etc/tinytouch/keys`.
+To remove everything: `rm -r /usr/local/lib/tinytouch /etc/tinytouch /var/lib/tinytouch`
+(this also deletes the backups, including the saved `sudo` file, and the smart-card driver
+directory `/etc/tinytouch/pcsc-drivers`: undo the `pcscd` drop-in first, as in Smart card
+above, or keep that directory).
 
 If `sudo` stops working and no root shell is open: `run0` (systemd's own elevation, which uses
 polkit rather than sudo's PAM file) gives a root shell, as does logging in as root on a text
@@ -215,8 +224,15 @@ console (Ctrl-Alt-F3) if root has a password.
 - A factory reset makes new keys (the touch then stops working until you pair again) and turns
   `piv_auto_type` back on (`status --check` reports it).
 - A `tinytouch.py` command that asks for a touch also lets the card sign for 30 seconds without
-  a new one. The verifier uses up or rejects such signatures, so `sudo` still needs its own
-  touch; with no finger enrolled, that command needs no touch at all.
+  a new one (up to eight signatures, from either key). The verifier tells that window from a
+  touch's: after a signature it asks for a second one with the same key, which a touch's window
+  refuses and this one gives while it has signatures left, and then one with the card's other
+  key, which a touch's window gives and this one, once used up, refuses. A signature from such a
+  window is rejected however many it has left, and one given before the touch line appeared is
+  discarded, so `sudo` is approved only by a touch made after its prompt. What remains: any
+  program running as you with access to the device can run such a command and spend those
+  windows, but cannot get a `sudo` approved without that touch. With no finger enrolled, the
+  command needs no touch at all.
 - If the verifier ever hangs and its 15-second watchdog kills it, the terminal may be left not
   showing what you type; `stty sane` (typed blind) or `reset` fixes it.
 - Two prompts waiting at once (two terminals, or `sudo` and a polkit dialog) race for one touch:

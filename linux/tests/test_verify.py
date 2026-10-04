@@ -30,7 +30,6 @@ TESTS = Path(__file__).resolve().parent
 LINUX = TESTS.parent
 sys.path.insert(0, str(TESTS))
 sys.path.insert(0, str(LINUX))
-import fake_pcsc  # noqa: E402
 import tinytouch_piv as tp  # noqa: E402
 import tinytouch_serial as ts  # noqa: E402
 from fake_device import FakeDevice, new_state  # noqa: E402
@@ -52,6 +51,14 @@ class Recorder(io.StringIO):
     def flush(self):
         super().flush()
         self.flushed = self.getvalue()
+
+
+def child_env(env: dict) -> dict:
+    """A subprocess test's environment, keeping the run's PYTHONDONTWRITEBYTECODE."""
+    env = dict(env)
+    if "PYTHONDONTWRITEBYTECODE" in os.environ:
+        env["PYTHONDONTWRITEBYTECODE"] = os.environ["PYTHONDONTWRITEBYTECODE"]
+    return env
 
 
 def spki_der(key) -> bytes:
@@ -139,8 +146,10 @@ class VerifyTest(Fixture):
         self.assertEqual(self.run_main("--timeout", "5"), 0)
         self.assertEqual(self.out, PROMPT + "\n")
         self.assertEqual(self.flushed, self.out)
-        # probe refused, touched challenge signed, window-kind probe refused
-        self.assertEqual(self.card.results, [0x6982, 0x9000, 0x6982])
+        # probe refused, touched challenge signed, then the window-kind probes: 9A refused (slot
+        # used), 9D signed (the touch window's second operation)
+        self.assertEqual(self.card.results, [0x6982, 0x9000, 0x6982, 0x9000])
+        self.assertEqual(self.card.ga_slots, [0x9A, 0x9A, 0x9A, 0x9D])
         self.assertTrue(all(len(b) == 256 for b in self.card.blocks))
         self.assertEqual(len(set(self.card.blocks)), len(self.card.blocks))  # a nonce each
         self.assert_card_left_clean()
@@ -234,11 +243,19 @@ class VerifyTest(Fixture):
         self.card.cert = b""
         self.assertEqual(self.run_main(), 3)
 
+    def test_certificate_with_unknown_key_algorithm(self):
+        rsa_oid = bytes.fromhex("06092a864886f70d010101")  # rsaEncryption, in the SPKI only
+        self.assertEqual(self.card.cert.count(rsa_oid), 1)
+        self.card.cert = self.card.cert.replace(rsa_oid, rsa_oid[:-1] + b"\x63")
+        self.assertEqual(self.run_main(), 3)
+        self.assertIn("reason=other_key", self.results()[-1])
+        self.assert_card_left_clean()
+
     def test_stale_touch_window_is_discarded(self):
         self.card.touch()  # a touch made before sudo started
         self.card.on_ga[3] = "touch"
         self.assertEqual(self.run_main("--timeout", "5"), 0)
-        self.assertEqual(self.card.results, [0x9000, 0x6982, 0x9000, 0x6982])
+        self.assertEqual(self.card.results, [0x9000, 0x6982, 0x9000, 0x6982, 0x9000])
         self.assertEqual(self.out, "An earlier touch was ignored; touch again.\n" + PROMPT + "\n")
         self.assertEqual(sum("event=stale_window" in line for line in self.results()), 1)
         self.assertEqual([p for p, line in self.logs if "stale_window" in line],
@@ -248,13 +265,77 @@ class VerifyTest(Fixture):
         self.card.auth()  # the CLI's serial AUTH: eight operations, slots may repeat
         self.card.on_ga[10] = "touch"
         self.assertEqual(self.run_main("--timeout", "5"), 0)
-        self.assertEqual(self.card.results, [0x9000] * 8 + [0x6982, 0x9000, 0x6982])
+        self.assertEqual(self.card.results, [0x9000] * 8 + [0x6982, 0x9000, 0x6982, 0x9000])
 
     def test_auth_window_after_refusal_is_rejected(self):
         self.card.on_ga[2] = "auth"
         self.assertEqual(self.run_main("--timeout", "5"), 5)
         self.assertEqual(self.card.results, [0x6982, 0x9000, 0x9000])
         self.assertIn("reason=auth_window", self.results()[-1])
+
+    def auth_window_with(self, operations):
+        def hook(card):
+            card.auth()
+            card.window.operations = operations
+        return hook
+
+    def test_auth_window_with_one_operation_left_is_rejected(self):
+        # The main challenge spends its last operation, so the 9A probe is refused as in a touch
+        # window; the 9D probe tells them apart.
+        self.card.on_ga[2] = self.auth_window_with(1)
+        self.assertEqual(self.run_main("--timeout", "5"), 5)
+        self.assertEqual(self.card.results, [0x6982, 0x9000, 0x6982, 0x6982])
+        self.assertEqual(self.card.ga_slots, [0x9A, 0x9A, 0x9A, 0x9D])
+        self.assertIn("reason=window_kind", self.results()[-1])
+        self.assertIn("result=bad_signature", self.results()[-1])
+        self.assert_card_left_clean()
+
+    def test_auth_window_with_two_operations_left_is_rejected(self):
+        self.card.on_ga[2] = self.auth_window_with(2)
+        self.assertEqual(self.run_main("--timeout", "5"), 5)
+        self.assertEqual(self.card.results, [0x6982, 0x9000, 0x9000])
+        self.assertIn("reason=auth_window", self.results()[-1])
+
+    def test_touch_window_with_9d_already_spent_fails_closed(self):
+        def touched_then_9d_used(card):
+            card.touch()
+            card.window.slots |= 0x02  # another client's GA 9D, as piv.c accounts it
+            card.window.operations -= 1
+        self.card.on_ga[2] = touched_then_9d_used
+        self.assertEqual(self.run_main("--timeout", "5"), 5)
+        self.assertEqual(self.card.results, [0x6982, 0x9000, 0x6982, 0x6982])
+        self.assertIn("reason=window_kind", self.results()[-1])
+
+    def test_malformed_9d_probe_reply_is_rejected(self):
+        def tamper_9d(card):
+            card.touch()
+            card.tamper = lambda reply: reply if card.ga_count < 4 else reply[:200]
+        self.card.on_ga[2] = tamper_9d
+        self.assertEqual(self.run_main("--timeout", "5"), 5)
+        self.assertEqual(self.card.results, [0x6982, 0x9000, 0x6982, 0x9000])
+        self.assertIn("reason=window_kind", self.results()[-1])
+
+    def test_window_kind_probes_use_fresh_blocks(self):
+        self.card.on_ga[2] = "touch"
+        self.assertEqual(self.run_main("--timeout", "5"), 0)
+        self.assertEqual(len(self.card.blocks), 4)
+        self.assertEqual(len(set(self.card.blocks)), 4)
+
+    def test_retry_before_any_refusal_is_not_a_refusal(self):
+        # A stale window, then a sharing violation on the first challenge: the stale signature
+        # that follows must still be discarded.
+        self.card.touch()
+        real = tp.find_card
+
+        def found_then_busy(*args):
+            found = real(*args)
+            self.scard.busy_begins = 1
+            return found
+        with mock.patch.object(tp, "find_card", found_then_busy):
+            self.assertEqual(self.run_main("--timeout", "0.5"), 1)
+        self.assertEqual(self.scard.busy_begins, 0)
+        self.assertEqual(self.card.results[0], 0x9000)  # the stale window signed, and was ignored
+        self.assertIn("reason=timeout", self.results()[-1])
 
     def test_signature_through_get_response(self):
         self.card.chunk_ga = True
@@ -306,6 +387,7 @@ class VerifyTest(Fixture):
         self.assertEqual(self.run_main("--timeout", "5"), 70)
         self.assertIn("result=internal", self.results()[-1])
         self.assertIn("error=RuntimeError", self.results()[-1])
+        self.assertIn(f"service=tinytouch-test user={USER} tty= ", self.results()[-1])
 
     def test_parent_gone_ends_the_wait(self):
         calls = []
@@ -317,6 +399,8 @@ class VerifyTest(Fixture):
             self.assertEqual(self.run_main("--timeout", "5"), 1)
         self.assertLess(self.elapsed, 1.0)
         self.assert_card_left_clean()
+        self.assertIn(f"service=tinytouch-test user={USER} tty= result=password reason=parent_gone",
+                      self.results()[-1])
 
     def test_log_failure_does_not_change_the_result(self):
         def broken(priority, line):
@@ -685,10 +769,10 @@ class ProcessTest(Fixture):
     def driver(self, argv, event=None, env=None):
         self.marker = self.tmp / "stuck"
         config = {"path": [str(TESTS), str(LINUX)], "key": str(self.key_file), "argv": argv,
-                  "event": event, "marker": str(self.marker), "SYS_ROOT": str(self.sys), "KEY_DIR": str(self.keys),
-                  "TRUSTED_ROOT": str(self.root), "PROC_CGROUP": str(self.cgroup),
-                  "SESSIONS_DIR": str(self.sessions)}
-        return [sys.executable, "-c", DRIVER, json.dumps(config)], dict(env or self.env)
+                  "event": event, "marker": str(self.marker), "SYS_ROOT": str(self.sys),
+                  "KEY_DIR": str(self.keys), "TRUSTED_ROOT": str(self.root),
+                  "PROC_CGROUP": str(self.cgroup), "SESSIONS_DIR": str(self.sessions)}
+        return [sys.executable, "-c", DRIVER, json.dumps(config)], child_env(env or self.env)
 
     def test_nothing_reaches_stderr(self):
         command, env = self.driver(["--timeout", "5"], event="stderr")
@@ -760,7 +844,8 @@ class ProcessTest(Fixture):
     def test_installed_program_isolates_itself(self):
         script = LINUX / "tinytouch_piv.py"
         for env, code in (({}, 0), ({"PAM_TYPE": "auth"}, 1)):
-            done = subprocess.run([sys.executable, "-I", str(script), "--help"], env=env,
+            done = subprocess.run([sys.executable, "-I", str(script), "--help"],
+                                  env=child_env(env),
                                   capture_output=True, timeout=30)
             self.assertEqual(done.returncode, code)
             self.assertIn(b"--timeout", done.stdout)
@@ -780,6 +865,9 @@ class EnrolTest(Fixture):
             directory.chmod(0o755)
         self.installed.write_bytes((LINUX / "tinytouch_piv.py").read_bytes())
         self.installed.chmod(0o755)
+        self.serial_copy = self.installed.parent / "tinytouch_serial.py"
+        self.serial_copy.write_bytes((LINUX / "tinytouch_serial.py").read_bytes())
+        self.serial_copy.chmod(0o644)
         patches = [mock.patch.object(tp, "geteuid", lambda: 0),
                    mock.patch.object(tp, "SELF", self.installed),
                    mock.patch.object(tp, "ENROL_TIMEOUT", 5.0),
@@ -800,12 +888,12 @@ class EnrolTest(Fixture):
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o644)
         self.assertIn(f"SHA256:{tp.key_id(spki_der(self.card.key))}", self.out)
         self.assertIn(f"wrote {self.path}", self.out)
-        self.assertEqual(self.card.results, [0x6982, 0x9000, 0x6982])
+        self.assertEqual(self.card.results, [0x6982, 0x9000, 0x6982, 0x9000])
         self.assertEqual(self.state.commands, ["STATUS"])
         self.assertEqual([p.name for p in self.keys.iterdir()], [self.path.name])
         self.assert_card_left_clean()
         # The verifier accepts what pairing wrote.
-        self.card.on_ga[5] = "touch"
+        self.card.on_ga[6] = "touch"
         self.assertEqual(self.run_main("--timeout", "5"), 0)
 
     def test_creates_missing_directories(self):
@@ -899,6 +987,29 @@ class EnrolTest(Fixture):
         self.installed.chmod(0o775)
         self.assert_refused("installed, root-owned")
         self.assertEqual(self.state.commands, [])
+
+    def test_refuses_an_untrusted_serial_module(self):
+        self.serial_copy.chmod(0o664)
+        self.assert_refused("tinytouch_serial.py")
+        self.serial_copy.chmod(0o644)
+        fstat = KeyStoreTest.owned_by_someone_else(
+            os.fstat, lambda fd, info: os.readlink(f"/proc/self/fd/{fd}") == str(self.serial_copy))
+        with mock.patch.object(tp.os, "fstat", fstat):
+            self.assert_refused("tinytouch_serial.py")
+        self.serial_copy.unlink()
+        self.assert_refused("tinytouch_serial.py")
+        self.assertEqual(self.state.commands, [])
+
+    def test_serial_module_writes_no_bytecode(self):
+        # Imported afresh from beside the installed verifier, as under `python3 -I`.
+        path = [p for p in sys.path if Path(p).resolve() != LINUX]
+        with mock.patch.dict(sys.modules), mock.patch.object(sys, "path", path), \
+                mock.patch.object(sys, "dont_write_bytecode", False):
+            sys.modules.pop("tinytouch_serial", None)
+            module = tp.serial_module()
+            self.assertTrue(sys.dont_write_bytecode)
+        self.assertEqual(Path(module.__file__), self.serial_copy)
+        self.assertFalse((self.installed.parent / "__pycache__").exists())
 
     def test_refuses_bad_user_names(self):
         for name in ("../x", "no_such_user_tinytouch", ""):
