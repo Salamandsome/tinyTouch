@@ -169,7 +169,9 @@ logging each fallback to the password as an error.
 - With the device plugged in and paired, `sudo` shows
   `Touch tinyTouch to approve sudo, or press Enter for password.` A touch with an enrolled finger
   approves the command. Enter goes straight to the password prompt. After 10 seconds without
-  either, the password prompt appears. Anything typed while the touch line is shown is not
+  either, the password prompt appears. Ctrl-C takes effect only once the touch wait has ended:
+  `pam_exec` runs the verifier detached from the terminal, and sudo acts on the interrupt after
+  PAM returns. Press Enter to skip the wait. Anything typed while the touch line is shown is not
   echoed and is discarded: a password typed there must be typed again at the password prompt.
 - Device unplugged, or not paired with you: the password prompt appears at once.
 - A touch made before the prompt appeared is not used; the verifier says
